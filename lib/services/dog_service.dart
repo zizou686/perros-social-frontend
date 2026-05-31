@@ -7,7 +7,7 @@ class DogService {
   factory DogService() => _instance;
   DogService._internal();
 
-  final String baseUrl = 'http://localhost:8080/api/dogs';
+  final String baseUrl = 'https://perros-social-backend.onrender.com/api/dogs';
 
   // GET: Obtener todos los perros
   Future<List<Dog>> getDogs() async {

@@ -16,3 +16,4 @@ test/
 *.swp
 .idea/
 .vscode/
+build/
