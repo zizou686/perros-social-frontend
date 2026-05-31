@@ -8,7 +8,7 @@ class AuthService {
   factory AuthService() => _instance;
   AuthService._internal();
 
-  final String baseUrl = 'http://localhost:8080/api/auth';
+  final String baseUrl = 'https://perros-social-backend.onrender.com/api/auth';
 
   Future<User?> login(String username, String password) async {
     try {

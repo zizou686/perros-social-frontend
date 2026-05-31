@@ -8,7 +8,7 @@ class CommentService {
   factory CommentService() => _instance;
   CommentService._internal();
 
-  final String baseUrl = 'http://localhost:8080/api';
+  final String baseUrl = 'https://perros-social-backend.onrender.com/api';
 
   // Obtener token almacenado
   Future<String?> _getToken() async {
