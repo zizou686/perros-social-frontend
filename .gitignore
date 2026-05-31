@@ -1,0 +1,37 @@
+# Flutter/Dart
+.dart_tool/
+.packages
+pubspec.lock
+build/
+*.lock
+*.pid
+*.old
+*.tmp
+
+# Android
+android/.gradle/
+android/local.properties
+android/app/debug.keystore
+android/app/build/
+android/capture.pcap
+
+# iOS
+ios/.symlinks/
+ios/Pods/
+ios/Flutter/Generated.xcconfig
+ios/Flutter/flutter_export_environment.sh
+ios/Flutter/Flutter.podspec
+
+# Web
+web/index.html
+web/favicon.png
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
