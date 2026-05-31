@@ -1,4 +1,4 @@
-FROM cirrusci/flutter:stable AS build
+FROM subfuzion/flutter:latest AS build
 
 WORKDIR /app
 
