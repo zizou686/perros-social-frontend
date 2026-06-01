@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'dart:async';
 import 'dart:typed_data';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -48,7 +49,7 @@ class FeedPage extends StatefulWidget {
   State<FeedPage> createState() => _FeedPageState();
 }
 
-class _FeedPageState extends State<FeedPage> {
+class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
   final PostService _postService = PostService();
   final LikeService _likeService = LikeService();
   final CommentService _commentService = CommentService();
@@ -58,9 +59,11 @@ class _FeedPageState extends State<FeedPage> {
   
   List<Post> _posts = [];
   bool _isLoading = true;
+  bool _isRefreshing = false;
   String? _errorMessage;
   bool _isAdmin = false;
   int _currentUserId = 0;
+  Timer? _autoRefreshTimer;
 
   final TextEditingController _contentController = TextEditingController();
   XFile? _selectedImage;
@@ -70,43 +73,81 @@ class _FeedPageState extends State<FeedPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _loadUserData();
     _loadPosts();
+    _startAutoRefresh();
+  }
+
+  @override
+  void dispose() {
+    _stopAutoRefresh();
+    WidgetsBinding.instance.removeObserver(this);
+    _contentController.dispose();
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _startAutoRefresh();
+      _loadPosts();
+    } else {
+      _stopAutoRefresh();
+    }
+  }
+
+  void _startAutoRefresh() {
+    _stopAutoRefresh();
+    _autoRefreshTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
+      print('🔄 Recargando automáticamente cada 15 segundos...');
+      _loadPosts(showLoading: false);
+    });
+  }
+
+  void _stopAutoRefresh() {
+    _autoRefreshTimer?.cancel();
+    _autoRefreshTimer = null;
   }
 
   Future<void> _loadUserData() async {
     final prefs = await SharedPreferences.getInstance();
     final roles = prefs.getStringList('roles') ?? [];
     final userId = prefs.getInt('userId') ?? 0;
+    print('🔍 Roles del usuario: $roles');
+    print('🔍 Es admin? ${roles.contains('ROLE_ADMIN')}');
     setState(() {
       _isAdmin = roles.contains('ROLE_ADMIN');
       _currentUserId = userId;
     });
   }
 
-  @override
-  void dispose() {
-    _contentController.dispose();
-    super.dispose();
-  }
-
-  Future<void> _loadPosts() async {
-    setState(() {
-      _isLoading = true;
-      _errorMessage = null;
-    });
+  Future<void> _loadPosts({bool showLoading = true}) async {
+    if (showLoading) {
+      setState(() {
+        _isLoading = true;
+        _errorMessage = null;
+      });
+    } else {
+      setState(() {
+        _isRefreshing = true;
+      });
+    }
+    
     try {
       final posts = await _postService.getPosts();
       print('✅ Posts cargados: ${posts.length}');
       setState(() {
         _posts = posts;
         _isLoading = false;
+        _isRefreshing = false;
       });
     } catch (e) {
       print('❌ Error al cargar posts: $e');
       setState(() {
         _errorMessage = e.toString();
         _isLoading = false;
+        _isRefreshing = false;
       });
     }
   }
@@ -133,6 +174,7 @@ class _FeedPageState extends State<FeedPage> {
     );
 
     if (confirm == true) {
+      _stopAutoRefresh();
       await _authService.logout();
       if (mounted) {
         Navigator.pushReplacement(
@@ -306,6 +348,7 @@ class _FeedPageState extends State<FeedPage> {
             duration: Duration(seconds: 2),
           ),
         );
+        await _loadPosts(showLoading: false);
       } catch (e) {
         print('❌ Error al eliminar: $e');
         ScaffoldMessenger.of(context).showSnackBar(
@@ -318,51 +361,46 @@ class _FeedPageState extends State<FeedPage> {
     }
   }
 
-  // Función para mostrar imágenes estilo FoodNet
   Widget _buildImage(String imageUrl) {
-  return Center(
-    child: SizedBox(
-      width: 280,  // Ancho moderado
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(12),
-        child: Image.network(
-          imageUrl,
-          height: 400,  // Altura más larga que ancha
-          width: 280,
-          fit: BoxFit.cover,
-          loadingBuilder: (context, child, loadingProgress) {
-            if (loadingProgress == null) return child;
-            return Container(
-              height: 400,
-              width: 280,
-              color: Colors.grey.shade300,
-              child: const Center(
-                child: CircularProgressIndicator(),
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(12),
+      child: Image.network(
+        imageUrl,
+        width: double.infinity,
+        height: 200,
+        fit: BoxFit.cover,
+        loadingBuilder: (context, child, loadingProgress) {
+          if (loadingProgress == null) return child;
+          return Container(
+            height: 200,
+            width: double.infinity,
+            color: Colors.grey.shade300,
+            child: const Center(
+              child: CircularProgressIndicator(),
+            ),
+          );
+        },
+        errorBuilder: (context, error, stackTrace) {
+          return Container(
+            height: 200,
+            width: double.infinity,
+            color: Colors.grey.shade300,
+            child: const Center(
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.broken_image, size: 40, color: Colors.red),
+                  SizedBox(height: 8),
+                  Text('No se pudo cargar la imagen', style: TextStyle(fontSize: 12)),
+                ],
               ),
-            );
-          },
-          errorBuilder: (context, error, stackTrace) {
-            return Container(
-              height: 400,
-              width: 280,
-              color: Colors.grey.shade300,
-              child: const Center(
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(Icons.broken_image, size: 40, color: Colors.red),
-                    SizedBox(height: 8),
-                    Text('No se pudo cargar la imagen', style: TextStyle(fontSize: 12)),
-                  ],
-                ),
-              ),
-            );
-          },
-        ),
+            ),
+          );
+        },
       ),
-    ),
-  );
-}
+    );
+  }
+
   void _showCreatePostDialog() {
     setState(() {
       _selectedImage = null;
@@ -423,7 +461,7 @@ class _FeedPageState extends State<FeedPage> {
                       builder: (context, snapshot) {
                         if (snapshot.hasData) {
                           return Container(
-                            height: 120,
+                            height: 150,
                             width: double.infinity,
                             decoration: BoxDecoration(
                               borderRadius: BorderRadius.circular(12),
@@ -435,7 +473,7 @@ class _FeedPageState extends State<FeedPage> {
                           );
                         }
                         return Container(
-                          height: 120,
+                          height: 150,
                           width: double.infinity,
                           color: Colors.grey.shade300,
                           child: const Center(child: CircularProgressIndicator()),
@@ -592,7 +630,7 @@ class _FeedPageState extends State<FeedPage> {
         actions: [
           IconButton(
             icon: const Icon(Icons.refresh),
-            onPressed: _loadPosts,
+            onPressed: () => _loadPosts(),
             tooltip: 'Recargar',
           ),
           if (_isAdmin)
@@ -636,7 +674,7 @@ class _FeedPageState extends State<FeedPage> {
                       Text(_errorMessage!),
                       const SizedBox(height: 16),
                       ElevatedButton(
-                        onPressed: _loadPosts,
+                        onPressed: () => _loadPosts(),
                         style: ElevatedButton.styleFrom(
                           backgroundColor: Colors.brown,
                         ),
@@ -664,111 +702,113 @@ class _FeedPageState extends State<FeedPage> {
                         ],
                       ),
                     )
-                  : ListView.builder(
-                      padding: const EdgeInsets.all(12),
-                      itemCount: _posts.length,
-                      itemBuilder: (context, index) {
-                        final post = _posts[index];
-                        final bool canDelete = _isAdmin || (post.user?['id'] == _currentUserId);
-                        
-                        return Card(
-                          elevation: 4,
-                          margin: const EdgeInsets.only(bottom: 12),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(16),
-                          ),
-                          child: Container(
-                            decoration: BoxDecoration(
+                  : RefreshIndicator(
+                      onRefresh: () => _loadPosts(showLoading: false),
+                      child: ListView.builder(
+                        padding: const EdgeInsets.all(12),
+                        itemCount: _posts.length,
+                        itemBuilder: (context, index) {
+                          final post = _posts[index];
+                          final bool canDelete = _isAdmin || (post.user?['id'] == _currentUserId);
+                          
+                          return Card(
+                            elevation: 4,
+                            margin: const EdgeInsets.only(bottom: 12),
+                            shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(16),
-                              gradient: LinearGradient(
-                                begin: Alignment.topLeft,
-                                end: Alignment.bottomRight,
-                                colors: [
-                                  Colors.white,
-                                  Colors.orange.shade50,
+                            ),
+                            child: Container(
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(16),
+                                gradient: LinearGradient(
+                                  begin: Alignment.topLeft,
+                                  end: Alignment.bottomRight,
+                                  colors: [
+                                    Colors.white,
+                                    Colors.orange.shade50,
+                                  ],
+                                ),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  ListTile(
+                                    contentPadding: const EdgeInsets.all(12),
+                                    leading: CircleAvatar(
+                                      backgroundColor: Colors.brown.shade100,
+                                      child: Icon(
+                                        Icons.pets,
+                                        color: Colors.brown.shade700,
+                                      ),
+                                    ),
+                                    title: Text(
+                                      post.user?['username'] ?? 'Usuario',
+                                      style: const TextStyle(
+                                        fontSize: 16,
+                                        fontWeight: FontWeight.bold,
+                                      ),
+                                    ),
+                                    subtitle: Text(
+                                      post.createdAt.substring(0, 10),
+                                      style: TextStyle(fontSize: 10, color: Colors.grey),
+                                    ),
+                                    trailing: canDelete
+                                        ? IconButton(
+                                            icon: Icon(Icons.delete_outline, color: Colors.red.shade300),
+                                            onPressed: () => _deletePost(post),
+                                            tooltip: 'Eliminar',
+                                          )
+                                        : null,
+                                  ),
+                                  Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                                    child: Text(
+                                      post.content,
+                                      style: const TextStyle(fontSize: 15),
+                                    ),
+                                  ),
+                                  if (post.imageUrl.isNotEmpty) ...[
+                                    const SizedBox(height: 8),
+                                    Padding(
+                                      padding: const EdgeInsets.symmetric(horizontal: 12),
+                                      child: _buildImage(post.imageUrl),
+                                    ),
+                                  ],
+                                  const SizedBox(height: 8),
+                                  Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                    child: Row(
+                                      children: [
+                                        IconButton(
+                                          icon: Icon(
+                                            Icons.favorite,
+                                            color: post.likesCount > 0 ? Colors.red : Colors.grey,
+                                          ),
+                                          onPressed: () => _toggleLike(post),
+                                        ),
+                                        Text('${post.likesCount} Me gusta'),
+                                        const SizedBox(width: 20),
+                                        IconButton(
+                                          icon: const Icon(Icons.comment),
+                                          onPressed: () {
+                                            Navigator.push(
+                                              context,
+                                              MaterialPageRoute(
+                                                builder: (context) => PostDetailScreen(post: post),
+                                              ),
+                                            );
+                                          },
+                                        ),
+                                        Text('${post.commentsCount} Comentarios'),
+                                      ],
+                                    ),
+                                  ),
                                 ],
                               ),
                             ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                // Header del post
-                                ListTile(
-                                  contentPadding: const EdgeInsets.all(12),
-                                  leading: CircleAvatar(
-                                    backgroundColor: Colors.brown.shade100,
-                                    child: Icon(
-                                      Icons.pets,
-                                      color: Colors.brown.shade700,
-                                    ),
-                                  ),
-                                  title: Text(
-                                    post.user?['username'] ?? 'Usuario',
-                                    style: const TextStyle(
-                                      fontSize: 16,
-                                      fontWeight: FontWeight.bold,
-                                    ),
-                                  ),
-                                  subtitle: Text(
-                                    post.createdAt.substring(0, 10),
-                                    style: TextStyle(fontSize: 10, color: Colors.grey),
-                                  ),
-                                  trailing: canDelete
-                                      ? IconButton(
-                                          icon: Icon(Icons.delete_outline, color: Colors.red.shade300),
-                                          onPressed: () => _deletePost(post),
-                                          tooltip: 'Eliminar',
-                                        )
-                                      : null,
-                                ),
-                                // Contenido del post
-                                Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 12),
-                                  child: Text(
-                                    post.content,
-                                    style: const TextStyle(fontSize: 15),
-                                  ),
-                                ),
-                                // Imagen estilo FoodNet
-                                if (post.imageUrl.isNotEmpty) ...[
-                                  const SizedBox(height: 12),
-                                  _buildImage(post.imageUrl),
-                                ],
-                                // Botones de like y comentario
-                                Padding(
-                                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                  child: Row(
-                                    children: [
-                                      IconButton(
-                                        icon: Icon(
-                                          Icons.favorite,
-                                          color: post.likesCount > 0 ? Colors.red : Colors.grey,
-                                        ),
-                                        onPressed: () => _toggleLike(post),
-                                      ),
-                                      Text('${post.likesCount} Me gusta'),
-                                      const SizedBox(width: 20),
-                                      IconButton(
-                                        icon: const Icon(Icons.comment),
-                                        onPressed: () {
-                                          Navigator.push(
-                                            context,
-                                            MaterialPageRoute(
-                                              builder: (context) => PostDetailScreen(post: post),
-                                            ),
-                                          );
-                                        },
-                                      ),
-                                      Text('${post.commentsCount} Comentarios'),
-                                    ],
-                                  ),
-                                ),
-                                const SizedBox(height: 8),
-                              ],
-                            ),
-                          ),
-                        );
-                      },
+                          );
+                        },
+                      ),
                     ),
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _showCreatePostDialog,
