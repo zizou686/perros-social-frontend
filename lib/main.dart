@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import 'dart:async';
 import 'dart:typed_data';
 import 'package:image_picker/image_picker.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -9,6 +8,7 @@ import 'services/like_service.dart';
 import 'services/comment_service.dart';
 import 'services/image_upload_service.dart';
 import 'services/auth_service.dart';
+import 'services/websocket_service.dart';
 import 'screens/login_screen.dart';
 import 'screens/post_detail_screen.dart';
 
@@ -21,7 +21,6 @@ void main() async {
 
 class MyApp extends StatelessWidget {
   final bool isLoggedIn;
-  
   const MyApp({super.key, required this.isLoggedIn});
 
   @override
@@ -29,14 +28,7 @@ class MyApp extends StatelessWidget {
     return MaterialApp(
       title: 'Perros Social',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData(
-        primarySwatch: Colors.brown,
-        useMaterial3: true,
-        colorScheme: ColorScheme.fromSeed(
-          seedColor: Colors.brown,
-          brightness: Brightness.light,
-        ),
-      ),
+      theme: ThemeData(primarySwatch: Colors.brown),
       home: isLoggedIn ? const FeedPage() : const LoginScreen(),
     );
   }
@@ -49,21 +41,22 @@ class FeedPage extends StatefulWidget {
   State<FeedPage> createState() => _FeedPageState();
 }
 
-class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
+class _FeedPageState extends State<FeedPage> {
   final PostService _postService = PostService();
   final LikeService _likeService = LikeService();
   final CommentService _commentService = CommentService();
   final ImageUploadService _imageUploadService = ImageUploadService();
   final AuthService _authService = AuthService();
+  final WebSocketService _wsService = WebSocketService();
   final ImagePicker _imagePicker = ImagePicker();
-  
+
   List<Post> _posts = [];
   bool _isLoading = true;
-  bool _isRefreshing = false;
   String? _errorMessage;
   bool _isAdmin = false;
   int _currentUserId = 0;
-  Timer? _autoRefreshTimer;
+
+  Map<int, Map<String, dynamic>> _postReactions = {};
 
   final TextEditingController _contentController = TextEditingController();
   XFile? _selectedImage;
@@ -73,123 +66,106 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addObserver(this);
     _loadUserData();
     _loadPosts();
-    _startAutoRefresh();
+    _connectWebSocket();
   }
 
   @override
   void dispose() {
-    _stopAutoRefresh();
-    WidgetsBinding.instance.removeObserver(this);
+    _wsService.disconnect();
     _contentController.dispose();
     super.dispose();
   }
 
-  @override
-  void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
-      _startAutoRefresh();
-      _loadPosts();
-    } else {
-      _stopAutoRefresh();
-    }
+  // ─── WebSocket ────────────────────────────────────────────────────────────
+
+  Future<void> _connectWebSocket() async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = prefs.getString('token') ?? '';
+
+    _wsService.onNewPost = (Post newPost) {
+      // Solo insertamos si no es una publicación propia (ya la insertamos localmente)
+      if (newPost.user?['id'] != _currentUserId) {
+        if (mounted) {
+          setState(() {
+            // Evitar duplicados
+            final exists = _posts.any((p) => p.id == newPost.id);
+            if (!exists) {
+              _posts.insert(0, newPost);
+            }
+          });
+        }
+      }
+    };
+
+    _wsService.connect(token);
   }
 
-  void _startAutoRefresh() {
-    _stopAutoRefresh();
-    _autoRefreshTimer = Timer.periodic(const Duration(seconds: 15), (timer) {
-      print('🔄 Recargando automáticamente cada 15 segundos...');
-      _loadPosts(showLoading: false);
-    });
-  }
-
-  void _stopAutoRefresh() {
-    _autoRefreshTimer?.cancel();
-    _autoRefreshTimer = null;
-  }
+  // ─── Datos ────────────────────────────────────────────────────────────────
 
   Future<void> _loadUserData() async {
     final prefs = await SharedPreferences.getInstance();
     final roles = prefs.getStringList('roles') ?? [];
     final userId = prefs.getInt('userId') ?? 0;
-    print('🔍 Roles del usuario: $roles');
-    print('🔍 Es admin? ${roles.contains('ROLE_ADMIN')}');
     setState(() {
       _isAdmin = roles.contains('ROLE_ADMIN');
       _currentUserId = userId;
     });
   }
 
-  Future<void> _loadPosts({bool showLoading = true}) async {
-    if (showLoading) {
-      setState(() {
-        _isLoading = true;
-        _errorMessage = null;
-      });
-    } else {
-      setState(() {
-        _isRefreshing = true;
-      });
-    }
-    
+  Future<void> _loadPosts() async {
+    setState(() {
+      _isLoading = true;
+      _errorMessage = null;
+    });
     try {
       final posts = await _postService.getPosts();
-      print('✅ Posts cargados: ${posts.length}');
       setState(() {
         _posts = posts;
         _isLoading = false;
-        _isRefreshing = false;
       });
     } catch (e) {
-      print('❌ Error al cargar posts: $e');
       setState(() {
         _errorMessage = e.toString();
         _isLoading = false;
-        _isRefreshing = false;
       });
     }
   }
+
+  // ─── Auth ─────────────────────────────────────────────────────────────────
 
   Future<void> _logout() async {
     final confirm = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         title: const Text('Cerrar Sesión'),
-        content: const Text('¿Estás seguro de que quieres cerrar sesión?'),
+        content: const Text('¿Estás seguro?'),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancelar'),
-          ),
+              onPressed: () => Navigator.pop(context, false),
+              child: const Text('Cancelar')),
           ElevatedButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            child: const Text('Cerrar Sesión'),
-          ),
+              onPressed: () => Navigator.pop(context, true),
+              child: const Text('Cerrar Sesión')),
         ],
       ),
     );
-
     if (confirm == true) {
-      _stopAutoRefresh();
+      _wsService.disconnect();
       await _authService.logout();
       if (mounted) {
         Navigator.pushReplacement(
-          context,
-          MaterialPageRoute(builder: (context) => const LoginScreen()),
-        );
+            context, MaterialPageRoute(builder: (_) => const LoginScreen()));
       }
     }
   }
 
+  // ─── Imagen ───────────────────────────────────────────────────────────────
+
   Future<void> _pickImage() async {
-    final XFile? image = await _imagePicker.pickImage(
-      source: ImageSource.gallery,
-      imageQuality: 80,
-    );
+    final XFile? image =
+        await _imagePicker.pickImage(source: ImageSource.gallery, imageQuality: 80);
     if (image != null) {
       setState(() {
         _selectedImage = image;
@@ -202,91 +178,45 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
 
   Future<void> _uploadImageDirect() async {
     if (_selectedImage == null) return;
-    
-    setState(() {
-      _isUploading = true;
-    });
-    
+    setState(() => _isUploading = true);
     try {
       final bytes = await _selectedImage!.readAsBytes();
-      final imageUrl = await _imageUploadService.uploadImageBytes(bytes, _selectedImage!.name);
-      print('✅ URL de imagen subida: $imageUrl');
+      final imageUrl =
+          await _imageUploadService.uploadImageBytes(bytes, _selectedImage!.name);
       setState(() {
         _uploadedImageUrl = imageUrl;
         _isUploading = false;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('🖼️ Imagen subida correctamente'),
-          backgroundColor: Colors.green,
-          duration: Duration(seconds: 2),
-        ),
-      );
     } catch (e) {
-      print('❌ Error al subir imagen: $e');
-      setState(() {
-        _isUploading = false;
-      });
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error al subir imagen: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
+      setState(() => _isUploading = false);
     }
   }
 
-  Future<void> _createPost() async {
-    if (_contentController.text.trim().isEmpty && _uploadedImageUrl == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Escribe algo o sube una imagen'),
-          backgroundColor: Colors.orange,
-          duration: Duration(seconds: 2),
-        ),
-      );
-      return;
-    }
+  // ─── Publicación ──────────────────────────────────────────────────────────
 
-    print('📝 Creando post con imagen URL: $_uploadedImageUrl');
+  Future<void> _createPost() async {
+    if (_contentController.text.trim().isEmpty && _uploadedImageUrl == null) return;
 
     try {
       final newPost = await _postService.createPost(
         _contentController.text.trim(),
         _uploadedImageUrl ?? '',
       );
-      print('✅ Post creado con imageUrl: ${newPost.imageUrl}');
+      // Insertamos nuestra propia publicación localmente de inmediato
       setState(() {
         _posts.insert(0, newPost);
         _selectedImage = null;
         _uploadedImageUrl = null;
       });
       _contentController.clear();
-      
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('📝 Publicación creada'),
-          backgroundColor: Colors.green,
-          duration: Duration(seconds: 2),
-        ),
-      );
     } catch (e) {
-      print('❌ Error al crear post: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
+      print('Error: $e');
     }
   }
 
   Future<void> _toggleLike(Post post) async {
     try {
-      print('🔄 Dando like al post: ${post.id}');
       final result = await _likeService.toggleLike(post.id);
-      print('✅ Resultado like: $result');
-      
       setState(() {
         final index = _posts.indexWhere((p) => p.id == post.id);
         if (index != -1) {
@@ -302,101 +232,128 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
         }
       });
     } catch (e) {
-      print('❌ Error en toggleLike: $e');
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Error al dar like: $e'),
-          backgroundColor: Colors.red,
-          duration: const Duration(seconds: 2),
-        ),
-      );
+      print('Error: $e');
     }
   }
 
   Future<void> _deletePost(Post post) async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (context) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
-        title: const Text('Eliminar publicación'),
-        content: Text('¿Estás seguro de que quieres eliminar esta publicación?'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context, false),
-            child: const Text('Cancelar'),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(context, true),
-            style: ElevatedButton.styleFrom(backgroundColor: Colors.red),
-            child: const Text('Eliminar'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirm == true) {
-      try {
-        await _postService.deletePost(post.id);
-        print('✅ Post eliminado: ${post.id}');
-        setState(() {
-          _posts.removeWhere((p) => p.id == post.id);
-        });
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('🗑️ Publicación eliminada'),
-            backgroundColor: Colors.orange,
-            duration: Duration(seconds: 2),
-          ),
-        );
-        await _loadPosts(showLoading: false);
-      } catch (e) {
-        print('❌ Error al eliminar: $e');
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error al eliminar: $e'),
-            backgroundColor: Colors.red,
-          ),
-        );
-      }
+    try {
+      await _postService.deletePost(post.id);
+      setState(() {
+        _posts.removeWhere((p) => p.id == post.id);
+      });
+    } catch (e) {
+      print('Error: $e');
     }
   }
 
-  Widget _buildImage(String imageUrl) {
-    return ClipRRect(
-      borderRadius: BorderRadius.circular(12),
-      child: Image.network(
-        imageUrl,
-        width: double.infinity,
-        height: 200,
-        fit: BoxFit.cover,
-        loadingBuilder: (context, child, loadingProgress) {
-          if (loadingProgress == null) return child;
-          return Container(
-            height: 200,
-            width: double.infinity,
-            color: Colors.grey.shade300,
-            child: const Center(
-              child: CircularProgressIndicator(),
-            ),
+  // ─── Reacciones ───────────────────────────────────────────────────────────
+
+  void _showReactionSelector(Post post) async {
+    try {
+      final result = await _likeService.toggleLike(post.id);
+      setState(() {
+        final index = _posts.indexWhere((p) => p.id == post.id);
+        if (index != -1) {
+          _posts[index] = Post(
+            id: post.id,
+            content: post.content,
+            imageUrl: post.imageUrl,
+            likesCount: result['likesCount'],
+            commentsCount: post.commentsCount,
+            createdAt: post.createdAt,
+            user: post.user,
           );
-        },
-        errorBuilder: (context, error, stackTrace) {
-          return Container(
-            height: 200,
-            width: double.infinity,
-            color: Colors.grey.shade300,
-            child: const Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
+        }
+      });
+    } catch (e) {
+      print('Error: $e');
+    }
+
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+          borderRadius: BorderRadius.vertical(top: Radius.circular(20))),
+      builder: (context) {
+        return Container(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Reacciona a esta publicación',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              const SizedBox(height: 16),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
                 children: [
-                  Icon(Icons.broken_image, size: 40, color: Colors.red),
-                  SizedBox(height: 8),
-                  Text('No se pudo cargar la imagen', style: TextStyle(fontSize: 12)),
+                  _reactionButton(post, '❤️'),
+                  _reactionButton(post, '😂'),
+                  _reactionButton(post, '😍'),
+                  _reactionButton(post, '😲'),
+                  _reactionButton(post, '😢'),
+                  _reactionButton(post, '😡'),
                 ],
               ),
+              const SizedBox(height: 16),
+              TextButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: const Text('Cancelar')),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _reactionButton(Post post, String emoji) {
+    final isSelected =
+        _postReactions[post.id] != null &&
+        _postReactions[post.id]!['reaction'] == emoji;
+    return GestureDetector(
+      onTap: () {
+        setState(() {
+          if (isSelected) {
+            _postReactions.remove(post.id);
+          } else {
+            _postReactions[post.id] = {'reaction': emoji, 'liked': true};
+          }
+        });
+        Navigator.pop(context);
+      },
+      child: Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: isSelected ? Colors.blue.shade50 : Colors.transparent,
+          borderRadius: BorderRadius.circular(40),
+          border: isSelected ? Border.all(color: Colors.blue) : null,
+        ),
+        child: Text(emoji, style: const TextStyle(fontSize: 32)),
+      ),
+    );
+  }
+
+  // ─── UI helpers ───────────────────────────────────────────────────────────
+
+  Widget _buildImage(String imageUrl) {
+    return Center(
+      child: SizedBox(
+        width: 280,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          child: Image.network(
+            imageUrl,
+            height: 400,
+            width: 280,
+            fit: BoxFit.cover,
+            errorBuilder: (context, error, stackTrace) => Container(
+              height: 400,
+              width: 280,
+              color: Colors.grey.shade300,
+              child: const Center(
+                  child: Icon(Icons.broken_image, size: 40, color: Colors.red)),
             ),
-          );
-        },
+          ),
+        ),
       ),
     );
   }
@@ -407,7 +364,6 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
       _uploadedImageUrl = null;
       _isUploading = false;
     });
-    
     showDialog(
       context: context,
       builder: (context) => StatefulBuilder(
@@ -417,185 +373,68 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
             child: Container(
               padding: const EdgeInsets.all(20),
               decoration: BoxDecoration(
-                borderRadius: BorderRadius.circular(20),
                 gradient: LinearGradient(
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                  colors: [Colors.brown.shade50, Colors.orange.shade50],
-                ),
+                    colors: [Colors.brown.shade50, Colors.orange.shade50]),
               ),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Row(
-                    children: [
-                      Icon(Icons.edit, color: Colors.brown, size: 28),
-                      SizedBox(width: 10),
-                      Text(
-                        'Nueva Publicación',
-                        style: TextStyle(
+                  const Text('Nueva Publicación',
+                      style: TextStyle(
                           fontSize: 22,
                           fontWeight: FontWeight.bold,
-                          color: Colors.brown,
-                        ),
-                      ),
-                    ],
-                  ),
+                          color: Colors.brown)),
                   const SizedBox(height: 20),
                   TextField(
-                    controller: _contentController,
-                    maxLines: 5,
-                    decoration: InputDecoration(
-                      hintText: '¿Qué está pasando con tu perro?',
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                      ),
-                      contentPadding: const EdgeInsets.all(12),
-                    ),
-                  ),
+                      controller: _contentController,
+                      maxLines: 5,
+                      decoration: const InputDecoration(
+                          hintText: '¿Qué pasa con tu perro?')),
                   const SizedBox(height: 12),
-                  
-                  if (_selectedImage != null) ...[
+                  if (_selectedImage != null)
                     FutureBuilder<Uint8List>(
                       future: _selectedImage!.readAsBytes(),
                       builder: (context, snapshot) {
                         if (snapshot.hasData) {
                           return Container(
-                            height: 150,
-                            width: double.infinity,
+                            height: 120,
                             decoration: BoxDecoration(
                               borderRadius: BorderRadius.circular(12),
                               image: DecorationImage(
-                                image: MemoryImage(snapshot.data!),
-                                fit: BoxFit.cover,
-                              ),
+                                  image: MemoryImage(snapshot.data!),
+                                  fit: BoxFit.cover),
                             ),
                           );
                         }
-                        return Container(
-                          height: 150,
-                          width: double.infinity,
-                          color: Colors.grey.shade300,
-                          child: const Center(child: CircularProgressIndicator()),
-                        );
+                        return const SizedBox(
+                            height: 120,
+                            child: Center(child: CircularProgressIndicator()));
                       },
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: () {
-                              setState(() {
-                                _selectedImage = null;
-                                _uploadedImageUrl = null;
-                                _isUploading = false;
-                              });
-                              setDialogState(() {});
-                            },
-                            icon: const Icon(Icons.delete),
-                            label: const Text('Quitar imagen'),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ] else ...[
-                    Row(
-                      children: [
-                        Expanded(
-                          child: OutlinedButton.icon(
-                            onPressed: () async {
-                              await _pickImage();
-                              setDialogState(() {});
-                            },
-                            icon: const Icon(Icons.image),
-                            label: const Text('Seleccionar imagen'),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ],
-                  
-                  if (_isUploading) ...[
-                    const SizedBox(height: 8),
-                    const LinearProgressIndicator(),
-                    const SizedBox(height: 4),
-                    const Text('Subiendo imagen a Cloudinary...', textAlign: TextAlign.center),
-                  ] else if (_uploadedImageUrl != null && _selectedImage != null) ...[
-                    const SizedBox(height: 8),
-                    Container(
-                      padding: const EdgeInsets.all(8),
-                      decoration: BoxDecoration(
-                        color: Colors.green.shade100,
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: const Row(
-                        children: [
-                          Icon(Icons.check_circle, color: Colors.green, size: 20),
-                          SizedBox(width: 8),
-                          Expanded(
-                            child: Text(
-                              '✓ Imagen subida correctamente',
-                              style: TextStyle(fontSize: 12),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                  ],
-                  
+                    )
+                  else
+                    ElevatedButton.icon(
+                        onPressed: _pickImage,
+                        icon: const Icon(Icons.image),
+                        label: const Text('Seleccionar imagen')),
+                  if (_isUploading) const LinearProgressIndicator(),
+                  if (_uploadedImageUrl != null)
+                    const Text('✓ Imagen lista',
+                        style: TextStyle(color: Colors.green)),
                   const SizedBox(height: 20),
                   Row(
                     children: [
                       Expanded(
-                        child: OutlinedButton(
-                          onPressed: () {
-                            setState(() {
-                              _selectedImage = null;
-                              _uploadedImageUrl = null;
-                              _isUploading = false;
-                            });
-                            Navigator.pop(context);
-                          },
-                          style: OutlinedButton.styleFrom(
-                            padding: const EdgeInsets.symmetric(vertical: 12),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                          ),
-                          child: const Text('Cancelar'),
-                        ),
-                      ),
+                          child: OutlinedButton(
+                              onPressed: () => Navigator.pop(context),
+                              child: const Text('Cancelar'))),
                       const SizedBox(width: 12),
                       Expanded(
-                        child: ElevatedButton(
-                          onPressed: () async {
-                            await _createPost();
-                            Navigator.pop(context);
-                            setState(() {
-                              _selectedImage = null;
-                              _uploadedImageUrl = null;
-                              _isUploading = false;
-                            });
-                          },
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: Colors.brown,
-                            foregroundColor: Colors.white,
-                            padding: const EdgeInsets.symmetric(vertical: 12),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(12),
-                            ),
-                          ),
-                          child: const Row(
-                            mainAxisAlignment: MainAxisAlignment.center,
-                            children: [
-                              Icon(Icons.send),
-                              SizedBox(width: 8),
-                              Text('Publicar'),
-                            ],
-                          ),
-                        ),
-                      ),
+                          child: ElevatedButton(
+                              onPressed: () async {
+                                await _createPost();
+                                Navigator.pop(context);
+                              },
+                              child: const Text('Publicar'))),
                     ],
                   ),
                 ],
@@ -607,216 +446,115 @@ class _FeedPageState extends State<FeedPage> with WidgetsBindingObserver {
     );
   }
 
+  // ─── Build ────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: Colors.grey.shade100,
       appBar: AppBar(
-        title: const Text(
-          '🐕 Perros Social',
-          style: TextStyle(fontWeight: FontWeight.bold),
-        ),
-        centerTitle: true,
-        elevation: 0,
-        flexibleSpace: Container(
-          decoration: const BoxDecoration(
-            gradient: LinearGradient(
-              colors: [Colors.brown, Colors.orange],
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-            ),
-          ),
-        ),
+        title: const Text('🐕 Perros Social',
+            style: TextStyle(fontWeight: FontWeight.bold)),
+        backgroundColor: Colors.brown,
+        foregroundColor: Colors.white,
         actions: [
-          IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: () => _loadPosts(),
-            tooltip: 'Recargar',
-          ),
+          // ✅ Botón de refresh eliminado — se reemplazó por WebSocket
           if (_isAdmin)
             IconButton(
-              icon: const Icon(Icons.admin_panel_settings),
-              onPressed: () {
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('👑 Eres administrador. Puedes eliminar cualquier publicación.'),
-                    backgroundColor: Colors.brown,
-                  ),
-                );
-              },
-              tooltip: 'Admin',
-            ),
-          IconButton(
-            icon: const Icon(Icons.logout),
-            onPressed: _logout,
-            tooltip: 'Cerrar Sesión',
-          ),
+                icon: const Icon(Icons.admin_panel_settings), onPressed: () {}),
+          IconButton(icon: const Icon(Icons.logout), onPressed: _logout),
         ],
       ),
       body: _isLoading
-          ? const Center(
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  CircularProgressIndicator(color: Colors.brown),
-                  SizedBox(height: 16),
-                  Text('Cargando publicaciones...'),
-                ],
-              ),
-            )
-          : _errorMessage != null
-              ? Center(
-                  child: Column(
-                    mainAxisAlignment: MainAxisAlignment.center,
-                    children: [
-                      const Icon(Icons.error_outline, size: 64, color: Colors.red),
-                      const SizedBox(height: 16),
-                      Text(_errorMessage!),
-                      const SizedBox(height: 16),
-                      ElevatedButton(
-                        onPressed: () => _loadPosts(),
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: Colors.brown,
+          ? const Center(child: CircularProgressIndicator())
+          : RefreshIndicator(
+              onRefresh: _loadPosts, // pull-to-refresh manual sigue disponible
+              child: ListView.builder(
+                padding: const EdgeInsets.all(12),
+                itemCount: _posts.length,
+                itemBuilder: (context, index) {
+                  final post = _posts[index];
+                  final canDelete =
+                      _isAdmin || (post.user?['id'] == _currentUserId);
+                  final reaction = _postReactions[post.id];
+                  final reactionEmoji =
+                      reaction != null ? reaction['reaction'] as String? : null;
+
+                  return Card(
+                    elevation: 4,
+                    margin: const EdgeInsets.only(bottom: 12),
+                    shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(16)),
+                    child: Column(
+                      children: [
+                        ListTile(
+                          leading: CircleAvatar(
+                              child: Icon(Icons.pets,
+                                  color: Colors.brown.shade700)),
+                          title: Text(post.user?['username'] ?? 'Usuario',
+                              style:
+                                  const TextStyle(fontWeight: FontWeight.bold)),
+                          subtitle: Text(post.createdAt.length >= 10
+                              ? post.createdAt.substring(0, 10)
+                              : post.createdAt),
+                          trailing: canDelete
+                              ? IconButton(
+                                  icon: Icon(Icons.delete,
+                                      color: Colors.red.shade300),
+                                  onPressed: () => _deletePost(post))
+                              : null,
                         ),
-                        child: const Text('Reintentar'),
-                      ),
-                    ],
-                  ),
-                )
-              : _posts.isEmpty
-                  ? Center(
-                      child: Column(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(Icons.pets, size: 80, color: Colors.grey.shade400),
-                          const SizedBox(height: 16),
-                          Text(
-                            'No hay publicaciones',
-                            style: TextStyle(color: Colors.grey.shade600),
-                          ),
-                          const SizedBox(height: 16),
-                          const Text(
-                            '¡Sé el primero en publicar!',
-                            style: TextStyle(fontSize: 12, color: Colors.grey),
-                          ),
+                        Padding(
+                            padding:
+                                const EdgeInsets.symmetric(horizontal: 12),
+                            child: Text(post.content)),
+                        if (post.imageUrl.isNotEmpty) ...[
+                          const SizedBox(height: 12),
+                          _buildImage(post.imageUrl)
                         ],
-                      ),
-                    )
-                  : RefreshIndicator(
-                      onRefresh: () => _loadPosts(showLoading: false),
-                      child: ListView.builder(
-                        padding: const EdgeInsets.all(12),
-                        itemCount: _posts.length,
-                        itemBuilder: (context, index) {
-                          final post = _posts[index];
-                          final bool canDelete = _isAdmin || (post.user?['id'] == _currentUserId);
-                          
-                          return Card(
-                            elevation: 4,
-                            margin: const EdgeInsets.only(bottom: 12),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(16),
-                            ),
-                            child: Container(
-                              decoration: BoxDecoration(
-                                borderRadius: BorderRadius.circular(16),
-                                gradient: LinearGradient(
-                                  begin: Alignment.topLeft,
-                                  end: Alignment.bottomRight,
-                                  colors: [
-                                    Colors.white,
-                                    Colors.orange.shade50,
-                                  ],
-                                ),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 12, vertical: 8),
+                          child: Row(
+                            children: [
+                              IconButton(
+                                icon: Icon(
+                                    post.likesCount > 0
+                                        ? Icons.favorite
+                                        : Icons.favorite_border,
+                                    size: 28),
+                                onPressed: () => _showReactionSelector(post),
                               ),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  ListTile(
-                                    contentPadding: const EdgeInsets.all(12),
-                                    leading: CircleAvatar(
-                                      backgroundColor: Colors.brown.shade100,
-                                      child: Icon(
-                                        Icons.pets,
-                                        color: Colors.brown.shade700,
-                                      ),
-                                    ),
-                                    title: Text(
-                                      post.user?['username'] ?? 'Usuario',
-                                      style: const TextStyle(
-                                        fontSize: 16,
-                                        fontWeight: FontWeight.bold,
-                                      ),
-                                    ),
-                                    subtitle: Text(
-                                      post.createdAt.substring(0, 10),
-                                      style: TextStyle(fontSize: 10, color: Colors.grey),
-                                    ),
-                                    trailing: canDelete
-                                        ? IconButton(
-                                            icon: Icon(Icons.delete_outline, color: Colors.red.shade300),
-                                            onPressed: () => _deletePost(post),
-                                            tooltip: 'Eliminar',
-                                          )
-                                        : null,
-                                  ),
-                                  Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 12),
-                                    child: Text(
-                                      post.content,
-                                      style: const TextStyle(fontSize: 15),
-                                    ),
-                                  ),
-                                  if (post.imageUrl.isNotEmpty) ...[
-                                    const SizedBox(height: 8),
-                                    Padding(
-                                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                                      child: _buildImage(post.imageUrl),
-                                    ),
-                                  ],
-                                  const SizedBox(height: 8),
-                                  Padding(
-                                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                                    child: Row(
-                                      children: [
-                                        IconButton(
-                                          icon: Icon(
-                                            Icons.favorite,
-                                            color: post.likesCount > 0 ? Colors.red : Colors.grey,
-                                          ),
-                                          onPressed: () => _toggleLike(post),
-                                        ),
-                                        Text('${post.likesCount} Me gusta'),
-                                        const SizedBox(width: 20),
-                                        IconButton(
-                                          icon: const Icon(Icons.comment),
-                                          onPressed: () {
-                                            Navigator.push(
-                                              context,
-                                              MaterialPageRoute(
-                                                builder: (context) => PostDetailScreen(post: post),
-                                              ),
-                                            );
-                                          },
-                                        ),
-                                        Text('${post.commentsCount} Comentarios'),
-                                      ],
-                                    ),
-                                  ),
-                                ],
+                              Text('${post.likesCount}'),
+                              if (reactionEmoji != null) ...[
+                                const SizedBox(width: 12),
+                                Text(reactionEmoji,
+                                    style: const TextStyle(fontSize: 18))
+                              ],
+                              const SizedBox(width: 20),
+                              IconButton(
+                                icon: const Icon(Icons.comment),
+                                onPressed: () => Navigator.push(
+                                    context,
+                                    MaterialPageRoute(
+                                        builder: (_) =>
+                                            PostDetailScreen(post: post))),
                               ),
-                            ),
-                          );
-                        },
-                      ),
+                              Text('${post.commentsCount}'),
+                            ],
+                          ),
+                        ),
+                      ],
                     ),
+                  );
+                },
+              ),
+            ),
       floatingActionButton: FloatingActionButton.extended(
         onPressed: _showCreatePostDialog,
         backgroundColor: Colors.brown,
-        foregroundColor: Colors.white,
         icon: const Icon(Icons.add),
         label: const Text('Nueva Publicación'),
-        elevation: 4,
       ),
     );
   }
